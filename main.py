@@ -26,7 +26,7 @@ class Linear:
         self.grad_b[:] = 0.0
 
     def __repr__(self):
-        return f"Linear({self.W.shape[1]} → {self.W.shape[0]})"
+        return f"Linear({self.W.shape[1]} -> {self.W.shape[0]})"
 
 
 class ReLU:
@@ -116,7 +116,7 @@ class MLP:
         self.zero_grad()
 
     def __repr__(self):
-        body = " → ".join(str(l) for l in self.layers)
+        body = " -> ".join(str(l) for l in self.layers)
         return f"MLP({body})"
 
     def param_count(self) -> int:
@@ -126,35 +126,105 @@ class MLP:
                 total += l.W.size + l.b.size
         return total
 
+
+def target_fn(x: np.ndarray) -> np.ndarray:
+    """f(x) = (x1^2, 3*x2, 5*x4 - x3, 3)"""
+    x1, x2, x3, x4 = x
+    return np.array([x1 ** 2, 3 * x2, 5 * x4 - x3, 3.0])
+
+
+def make_dataset(n_samples: int = 2000, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(0, 1, size=(n_samples, 4))
+    Y = np.stack([target_fn(x) for x in X])
+    return X, Y
+
+
+def train_test_split(X, Y, test_ratio=0.2, seed=42):
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(X))
+    n_test = int(len(X) * test_ratio)
+    return X[idx[n_test:]], Y[idx[n_test:]], X[idx[:n_test]], Y[idx[:n_test]]
+
+
+def make_batches(X, Y, batch_size: int, rng):
+    idx = rng.permutation(len(X))
+    for start in range(0, len(X), batch_size):
+        bi = idx[start:start + batch_size]
+        yield X[bi], Y[bi]
+
+
+def train(mlp: MLP,
+          X_train, Y_train,
+          X_val, Y_val,
+          num_epochs: int = 50,
+          batch_size: int = 32,
+          lr: float = 1e-3,
+          seed: int = 0) -> dict:
+
+    rng = np.random.default_rng(seed)
+    history = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(1, num_epochs + 1):
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for X_batch, Y_batch in make_batches(X_train, Y_train, batch_size, rng):
+            batch_loss = 0.0
+
+            for x, y in zip(X_batch, Y_batch):
+                mlp.forward(x)
+                batch_loss += mlp.loss(y)
+                mlp.backward()
+
+            mlp.update(lr=lr, batch_size=len(X_batch))
+
+            epoch_loss += batch_loss / len(X_batch)
+            n_batches += 1
+
+        val_loss = 0.0
+        for x, y in zip(X_val, Y_val):
+            y_pred = mlp.forward(x)
+            val_loss += mlp.loss_fn.forward(y_pred, y)
+        val_loss /= len(X_val)
+        train_loss = epoch_loss / n_batches
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"Epoch {epoch:3d}/{num_epochs}  "
+                  f"train_loss={train_loss:.5f}  val_loss={val_loss:.5f}")
+
+    return history
+
+def evaluate(mlp: MLP, X, Y):
+    preds = np.stack([mlp.forward(x) for x in X])
+    mse = np.mean((preds - Y) ** 2)
+    mae = np.mean(np.abs(preds - Y))
+    print(f"\nEvaluation:  MSE={mse:.5f}  MAE={mae:.5f}")
+
+    for i in range(5):
+        print(f"  pred={preds[i].round(3)}  true={Y[i].round(3)}")
+    return mse, mae
+
+
 if __name__ == "__main__":
-    np.random.seed(0)
-    print("=== Smoke-test MLP ===\n")
+    np.random.seed(7)
 
-    mlp = MLP([4, 16, 8, 4])
-    print(mlp)
-    print(f"Параметров: {mlp.param_count()}\n")
+    print("Basic MLP training\n")
 
-    x = np.random.randn(4)
-    y_true = np.array([1.0, 6.0, 2.5, 3.0])
+    X, Y = make_dataset(n_samples=3000)
+    X_train, Y_train, X_val, Y_val = train_test_split(X, Y)
 
-    # one training step
-    y_pred = mlp.forward(x)
-    L = mlp.loss(y_true)
-    mlp.backward()
-    mlp.update(lr=0.01)
+    print(f"Train: {len(X_train)}  Val: {len(Y_val)}")
+    print(f"y-range: min={Y.min():.2f}  max={Y.max():.2f}\n")
 
-    print(f"Input:  {x}")
-    print(f"Pred:   {y_pred}")
-    print(f"Target: {y_true}")
-    print(f"Loss:   {L:.4f}")
+    mlp = MLP([4, 64, 32, 16, 4])
+    print(mlp, f"  ({mlp.param_count()} params)\n")
 
-    losses = []
-    for _ in range(200):
-        y_pred = mlp.forward(x)
-        L = mlp.loss(y_true)
-        mlp.backward()
-        mlp.update(lr=0.01)
-        losses.append(L)
+    history = train(mlp, X_train, Y_train, X_val, Y_val,
+                    num_epochs=60, batch_size=32, lr=5e-3)
 
-    print(f"\nLoss после 200 итераций: {losses[-1]:.6f}")
-    print(f"Уменьшился: {losses[0] > losses[-1]}")
+    evaluate(mlp, X_val, Y_val)
+
