@@ -1,6 +1,5 @@
 import numpy as np
 
-
 class Linear:
 
     def __init__(self, in_features: int, out_features: int):
@@ -61,28 +60,101 @@ class MSELoss:
         return 2.0 * self._diff / self._n
 
 
+class MLP:
+    def __init__(self, layer_sizes: list[int]):
+        self.layers = []
+        n = len(layer_sizes)
+        for i in range(n - 1):
+            self.layers.append(Linear(layer_sizes[i], layer_sizes[i + 1]))
+            if i < n - 2:
+                self.layers.append(ReLU())
+
+        self.loss_fn = MSELoss()
+        self._last_output = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        out = x
+        for layer in self.layers:
+            out = layer.forward(out)
+        self._last_output = out
+        return out
+
+    def loss(self, y_true: np.ndarray) -> float:
+        return self.loss_fn.forward(self._last_output, y_true)
+
+    def backward(self):
+        grad = self.loss_fn.backward()
+        for layer in reversed(self.layers):
+            grad = layer.backward(grad)
+
+    def zero_grad(self):
+        for layer in self.layers:
+            if isinstance(layer, Linear):
+                layer.zero_grad()
+
+    def update(self,
+               lr: float = 1e-3,
+               batch_size: int = 1,
+               l2_lambda: float = 0.0,
+               grad_clip: float | None = None):
+
+        for layer in self.layers:
+            if not isinstance(layer, Linear):
+                continue
+
+            gW = layer.grad_W / batch_size
+            gb = layer.grad_b / batch_size
+
+            if grad_clip is not None:
+                norm = np.linalg.norm(gW)
+                if norm > grad_clip:
+                    gW = gW * grad_clip / norm
+
+            layer.W -= lr * (gW + l2_lambda * layer.W)
+            layer.b -= lr * gb
+
+        self.zero_grad()
+
+    def __repr__(self):
+        body = " → ".join(str(l) for l in self.layers)
+        return f"MLP({body})"
+
+    def param_count(self) -> int:
+        total = 0
+        for l in self.layers:
+            if isinstance(l, Linear):
+                total += l.W.size + l.b.size
+        return total
+
 if __name__ == "__main__":
-    np.random.seed(42)
-    print("=== Smoke-test слоёв ===\n")
+    np.random.seed(0)
+    print("=== Smoke-test MLP ===\n")
 
-    x = np.array([1.0, -2.0, 3.0, 0.5])
+    mlp = MLP([4, 16, 8, 4])
+    print(mlp)
+    print(f"Параметров: {mlp.param_count()}\n")
 
-    lin = Linear(4, 3)
-    y = lin.forward(x)
-    print(f"Linear forward:   {y}")
-    g = lin.backward(np.ones(3))
-    print(f"Linear grad_W:\n{lin.grad_W}")
-    print(f"Linear grad back: {g}\n")
+    x = np.random.randn(4)
+    y_true = np.array([1.0, 6.0, 2.5, 3.0])
 
-    relu = ReLU()
-    y = relu.forward(np.array([-1.0, 0.5, -0.3, 2.0]))
-    print(f"ReLU forward:  {y}")
-    g = relu.backward(np.ones(4))
-    print(f"ReLU backward: {g}\n")
+    # one training step
+    y_pred = mlp.forward(x)
+    L = mlp.loss(y_true)
+    mlp.backward()
+    mlp.update(lr=0.01)
 
-    loss_fn = MSELoss()
-    pred = np.array([1.0, 2.0, 3.0])
-    true = np.array([1.5, 1.5, 3.5])
-    L = loss_fn.forward(pred, true)
-    print(f"MSELoss: {L:.4f}")
-    print(f"MSELoss grad: {loss_fn.backward()}")
+    print(f"Input:  {x}")
+    print(f"Pred:   {y_pred}")
+    print(f"Target: {y_true}")
+    print(f"Loss:   {L:.4f}")
+
+    losses = []
+    for _ in range(200):
+        y_pred = mlp.forward(x)
+        L = mlp.loss(y_true)
+        mlp.backward()
+        mlp.update(lr=0.01)
+        losses.append(L)
+
+    print(f"\nLoss после 200 итераций: {losses[-1]:.6f}")
+    print(f"Уменьшился: {losses[0] > losses[-1]}")
