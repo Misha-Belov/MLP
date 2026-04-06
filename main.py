@@ -1,25 +1,27 @@
+
 import numpy as np
+import copy
+
+
 
 class Linear:
 
-    def __init__(self, in_features: int, out_features: int):
-        scale = np.sqrt(2.0 / in_features)
-        self.W = np.random.randn(out_features, in_features) * scale
-        self.b = np.zeros(out_features)
-
+    def __init__(self, in_f, out_f):
+        scale = np.sqrt(2.0 / in_f)
+        self.W = np.random.randn(out_f, in_f) * scale
+        self.b = np.zeros(out_f)
         self.grad_W = np.zeros_like(self.W)
         self.grad_b = np.zeros_like(self.b)
-
         self._x = None
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x):
         self._x = x.copy()
         return self.W @ x + self.b
 
-    def backward(self, grad_output: np.ndarray) -> np.ndarray:
-        self.grad_W += np.outer(grad_output, self._x)
-        self.grad_b += grad_output
-        return self.W.T @ grad_output
+    def backward(self, g):
+        self.grad_W += np.outer(g, self._x)
+        self.grad_b += g
+        return self.W.T @ g
 
     def zero_grad(self):
         self.grad_W[:] = 0.0
@@ -30,201 +32,272 @@ class Linear:
 
 
 class ReLU:
-
     def __init__(self):
         self._mask = None
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x):
         self._mask = x > 0
         return x * self._mask
 
-    def backward(self, grad_output: np.ndarray) -> np.ndarray:
-        return grad_output * self._mask
+    def backward(self, g):
+        return g * self._mask
 
     def __repr__(self):
-        return "ReLU()"
+        return "ReLU"
 
 
 class MSELoss:
-
     def __init__(self):
         self._diff = None
         self._n = None
 
-    def forward(self, y_pred: np.ndarray, y_true: np.ndarray) -> float:
+    def forward(self, y_pred, y_true):
         self._diff = y_pred - y_true
         self._n = len(y_pred)
         return float(np.mean(self._diff ** 2))
 
-    def backward(self) -> np.ndarray:
+    def backward(self):
         return 2.0 * self._diff / self._n
 
 
 class MLP:
-    def __init__(self, layer_sizes: list[int]):
+    def __init__(self, sizes):
         self.layers = []
-        n = len(layer_sizes)
-        for i in range(n - 1):
-            self.layers.append(Linear(layer_sizes[i], layer_sizes[i + 1]))
-            if i < n - 2:
+        for i in range(len(sizes) - 1):
+            self.layers.append(Linear(sizes[i], sizes[i + 1]))
+            if i < len(sizes) - 2:
                 self.layers.append(ReLU())
-
         self.loss_fn = MSELoss()
-        self._last_output = None
+        self._out = None
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
+    def forward(self, x):
         out = x
         for layer in self.layers:
             out = layer.forward(out)
-        self._last_output = out
+        self._out = out
         return out
 
-    def loss(self, y_true: np.ndarray) -> float:
-        return self.loss_fn.forward(self._last_output, y_true)
+    def loss(self, y):
+        return self.loss_fn.forward(self._out, y)
 
     def backward(self):
-        grad = self.loss_fn.backward()
+        g = self.loss_fn.backward()
         for layer in reversed(self.layers):
-            grad = layer.backward(grad)
+            g = layer.backward(g)
 
     def zero_grad(self):
-        for layer in self.layers:
-            if isinstance(layer, Linear):
-                layer.zero_grad()
-
-    def update(self,
-               lr: float = 1e-3,
-               batch_size: int = 1,
-               l2_lambda: float = 0.0,
-               grad_clip: float | None = None):
-
-        for layer in self.layers:
-            if not isinstance(layer, Linear):
-                continue
-
-            gW = layer.grad_W / batch_size
-            gb = layer.grad_b / batch_size
-
-            if grad_clip is not None:
-                norm = np.linalg.norm(gW)
-                if norm > grad_clip:
-                    gW = gW * grad_clip / norm
-
-            layer.W -= lr * (gW + l2_lambda * layer.W)
-            layer.b -= lr * gb
-
-        self.zero_grad()
-
-    def __repr__(self):
-        body = " -> ".join(str(l) for l in self.layers)
-        return f"MLP({body})"
-
-    def param_count(self) -> int:
-        total = 0
         for l in self.layers:
             if isinstance(l, Linear):
-                total += l.W.size + l.b.size
-        return total
+                l.zero_grad()
+
+    def _linear_layers(self):
+        return [l for l in self.layers if isinstance(l, Linear)]
+
+    def param_count(self):
+        return sum(l.W.size + l.b.size for l in self._linear_layers())
+
+    def __repr__(self):
+        return "MLP(" + " -> ".join(str(l) for l in self.layers) + ")"
 
 
-def target_fn(x: np.ndarray) -> np.ndarray:
-    """f(x) = (x1^2, 3*x2, 5*x4 - x3, 3)"""
+class StandardScaler:
+    def fit(self, X):
+        self.mean_ = X.mean(axis=0)
+        self.std_ = X.std(axis=0) + 1e-8
+        return self
+
+    def transform(self, X):
+        return (X - self.mean_) / self.std_
+
+    def inverse_transform(self, X):
+        return X * self.std_ + self.mean_
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+
+
+def global_grad_norm(mlp):
+    sq = sum(
+        np.sum(l.grad_W ** 2) + np.sum(l.grad_b ** 2)
+        for l in mlp._linear_layers()
+    )
+    return float(np.sqrt(sq))
+
+
+def clip_grads(mlp, max_norm):
+    norm = global_grad_norm(mlp)
+    if norm > max_norm:
+        scale = max_norm / (norm + 1e-8)
+        for l in mlp._linear_layers():
+            l.grad_W *= scale
+            l.grad_b *= scale
+    return norm
+
+
+def sgd_step(mlp, lr, l2=0.0):
+    for l in mlp._linear_layers():
+        l.W -= lr * (l.grad_W + l2 * l.W)
+        l.b -= lr * l.grad_b
+    mlp.zero_grad()
+
+
+def save_weights(mlp):
+    return [(l.W.copy(), l.b.copy()) for l in mlp._linear_layers()]
+
+
+def load_weights(mlp, weights):
+    for (W, b), l in zip(weights, mlp._linear_layers()):
+        l.W[:] = W
+        l.b[:] = b
+
+
+def target_fn(x):
+    """f(x1, x2, x3, x4) = (x1^2, 3*x2, 5*x4 - x3, 3)^T"""
     x1, x2, x3, x4 = x
-    return np.array([x1 ** 2, 3 * x2, 5 * x4 - x3, 3.0])
+    return np.array([x1 ** 2, 3.0 * x2, 5.0 * x4 - x3, 3.0])
 
 
-def make_dataset(n_samples: int = 2000, seed: int = 42):
+def make_dataset(n=5000, seed=42):
     rng = np.random.default_rng(seed)
-    X = rng.normal(0, 1, size=(n_samples, 4))
-    Y = np.stack([target_fn(x) for x in X])
+    X = rng.normal(0.0, 1.0, (n, 4))
+    Y = np.stack([target_fn(xi) for xi in X])
     return X, Y
 
 
-def train_test_split(X, Y, test_ratio=0.2, seed=42):
+def split(X, Y, test_ratio=0.2, seed=0):
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(X))
     n_test = int(len(X) * test_ratio)
     return X[idx[n_test:]], Y[idx[n_test:]], X[idx[:n_test]], Y[idx[:n_test]]
 
 
-def make_batches(X, Y, batch_size: int, rng):
-    idx = rng.permutation(len(X))
-    for start in range(0, len(X), batch_size):
-        bi = idx[start:start + batch_size]
-        yield X[bi], Y[bi]
-
-
-def train(mlp: MLP,
-          X_train, Y_train,
-          X_val, Y_val,
-          num_epochs: int = 50,
-          batch_size: int = 32,
-          lr: float = 1e-3,
-          seed: int = 0) -> dict:
+def train(mlp, X_tr, Y_tr, X_val, Y_val,
+          num_epochs=200, batch_size=64, lr=8e-3,
+          lr_decay=0.98, l2=5e-5, grad_clip=5.0,
+          patience=25, seed=0):
 
     rng = np.random.default_rng(seed)
-    history = {"train_loss": [], "val_loss": []}
+    history = {"train": [], "val": [], "lr": [], "gnorm": []}
+
+    best_val = np.inf
+    best_w = None
+    no_imp = 0
+    cur_lr = lr
 
     for epoch in range(1, num_epochs + 1):
-        epoch_loss = 0.0
-        n_batches = 0
+        idx = rng.permutation(len(X_tr))
+        X_s, Y_s = X_tr[idx], Y_tr[idx]
 
-        for X_batch, Y_batch in make_batches(X_train, Y_train, batch_size, rng):
+        ep_loss, ep_norm, n_b = 0.0, 0.0, 0
+
+        for s in range(0, len(X_tr), batch_size):
+            Xb = X_s[s:s + batch_size]
+            Yb = Y_s[s:s + batch_size]
+            bs = len(Xb)
+
             batch_loss = 0.0
-
-            for x, y in zip(X_batch, Y_batch):
+            for x, y in zip(Xb, Yb):
                 mlp.forward(x)
                 batch_loss += mlp.loss(y)
                 mlp.backward()
 
-            mlp.update(lr=lr, batch_size=len(X_batch))
+            for l in mlp._linear_layers():
+                l.grad_W /= bs
+                l.grad_b /= bs
 
-            epoch_loss += batch_loss / len(X_batch)
-            n_batches += 1
+            norm = clip_grads(mlp, grad_clip)
+            sgd_step(mlp, cur_lr, l2)
 
-        val_loss = 0.0
-        for x, y in zip(X_val, Y_val):
-            y_pred = mlp.forward(x)
-            val_loss += mlp.loss_fn.forward(y_pred, y)
-        val_loss /= len(X_val)
-        train_loss = epoch_loss / n_batches
+            ep_loss += batch_loss / bs
+            ep_norm += norm
+            n_b += 1
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
+        train_loss = ep_loss / n_b
+        avg_norm = ep_norm / n_b
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{num_epochs}  "
-                  f"train_loss={train_loss:.5f}  val_loss={val_loss:.5f}")
+        val_loss = float(np.mean([
+            mlp.loss_fn.forward(mlp.forward(x), y)
+            for x, y in zip(X_val, Y_val)
+        ]))
+
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        history["lr"].append(cur_lr)
+        history["gnorm"].append(avg_norm)
+
+        if val_loss < best_val - 1e-7:
+            best_val = val_loss
+            best_w = save_weights(mlp)
+            no_imp = 0
+        else:
+            no_imp += 1
+            if no_imp >= patience:
+                print(f"Early stopping at epoch {epoch},  best val loss: {best_val:.5f}")
+                break
+
+        cur_lr *= lr_decay
+
+        if epoch % 20 == 0 or epoch == 1:
+            print(f"Epoch {epoch:3d}  train={train_loss:.5f}  "
+                  f"val={val_loss:.5f}  lr={cur_lr:.2e}  |grad|={avg_norm:.3f}")
+
+    if best_w:
+        load_weights(mlp, best_w)
+        print(f"Best weights restored (val={best_val:.5f})")
 
     return history
 
-def evaluate(mlp: MLP, X, Y):
-    preds = np.stack([mlp.forward(x) for x in X])
-    mse = np.mean((preds - Y) ** 2)
-    mae = np.mean(np.abs(preds - Y))
-    print(f"\nEvaluation:  MSE={mse:.5f}  MAE={mae:.5f}")
 
-    for i in range(5):
-        print(f"  pred={preds[i].round(3)}  true={Y[i].round(3)}")
-    return mse, mae
+
+def main():
+    np.random.seed(42)
+
+    X_raw, Y_raw = make_dataset(n=6000, seed=42)
+    X_tr_r, Y_tr_r, X_v_r, Y_v_r = split(X_raw, Y_raw)
+
+    print(f"Dataset: {len(X_raw)} samples  (train={len(X_tr_r)}, val={len(X_v_r)})")
+
+    sx = StandardScaler().fit(X_tr_r)
+    sy = StandardScaler().fit(Y_tr_r)
+
+    X_tr = sx.transform(X_tr_r)
+    Y_tr = sy.transform(Y_tr_r)
+    X_v  = sx.transform(X_v_r)
+    Y_v  = sy.transform(Y_v_r)
+
+    mlp = MLP([4, 128, 64, 32, 4])
+    print(f"Architecture: {mlp}")
+    print(f"Parameters:   {mlp.param_count():,}\n")
+
+    history = train(
+        mlp, X_tr, Y_tr, X_v, Y_v,
+        num_epochs=300,
+        batch_size=64,
+        lr=8e-3,
+        lr_decay=0.98,
+        l2=5e-5,
+        grad_clip=5.0,
+        patience=30,
+    )
+
+    preds_n = np.stack([mlp.forward(x) for x in X_v])
+    preds   = sy.inverse_transform(preds_n)
+
+    mse = float(np.mean((preds - Y_v_r) ** 2))
+    mae = float(np.mean(np.abs(preds - Y_v_r)))
+    r2  = 1 - np.sum((preds - Y_v_r) ** 2) / (
+              np.sum((Y_v_r - Y_v_r.mean(axis=0)) ** 2) + 1e-9)
+
+    print(f"\nValidation results:")
+    print(f"  MSE = {mse:.5f}")
+    print(f"  MAE = {mae:.5f}")
+    print(f"  R2  = {r2:.5f}")
+
+    print("\nSample predictions:")
+    print(f"  {'Predicted':45s}  True")
+    for i in range(8):
+        print(f"  {str(preds[i].round(3)):45s}  {Y_v_r[i].round(3)}")
 
 
 if __name__ == "__main__":
-    np.random.seed(7)
-
-    print("Basic MLP training\n")
-
-    X, Y = make_dataset(n_samples=3000)
-    X_train, Y_train, X_val, Y_val = train_test_split(X, Y)
-
-    print(f"Train: {len(X_train)}  Val: {len(Y_val)}")
-    print(f"y-range: min={Y.min():.2f}  max={Y.max():.2f}\n")
-
-    mlp = MLP([4, 64, 32, 16, 4])
-    print(mlp, f"  ({mlp.param_count()} params)\n")
-
-    history = train(mlp, X_train, Y_train, X_val, Y_val,
-                    num_epochs=60, batch_size=32, lr=5e-3)
-
-    evaluate(mlp, X_val, Y_val)
-
+    main()
